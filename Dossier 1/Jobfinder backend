@@ -1,0 +1,169 @@
+# All App backend 
+
+#!pip install pydantic[email]
+#!pip install python-jose
+#!pip install motor
+#!pip install python-dotenv
+#!pip install passlib
+#!pip install pydantic
+#!pip install openrouter
+#!pip install python-multipart
+
+from fastapi import FastAPI, Depends, UploadFile, File, HTTPException, status
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import OAuth2PasswordRequestForm
+from motor.motor_asyncio import AsyncIOMotorClient
+from jose import JWTError, jwt
+from passlib.context import CryptContext
+from pydantic import BaseModel, EmailStr
+from typing import List, Optional
+from datetime import datetime, timedelta
+import os
+import openai
+import smtplib
+from email.mime.multipart import MIMEMultipart
+from email.mime.application import MIMEApplication
+from email.mime.text import MIMEText
+
+# Load environment variables
+from dotenv import load_dotenv
+load_dotenv()
+
+# Constants
+SECRET_KEY = os.getenv("SECRET_KEY")
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 60
+MONGO_URL = os.getenv("MONGO_URL")
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+EMAIL_SENDER = os.getenv("EMAIL_SENDER")
+EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD")
+SMTP_SERVER = os.getenv("SMTP_SERVER")
+SMTP_PORT = int(os.getenv("SMTP_PORT", 587))
+
+# Init
+app = FastAPI()
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+client = AsyncIOMotorClient(MONGO_URL)
+db = client["job_app"]
+
+# Models
+class User(BaseModel):
+    email: EmailStr
+    password: str
+    name: str
+    phone: Optional[str] = None
+
+class Job(BaseModel):
+    title: str
+    company: str
+    location: str
+    deadline: datetime
+    email: EmailStr
+    description: str
+    rank: Optional[int] = 0
+
+class Application(BaseModel):
+    job_id: str
+    user_id: str
+    cover_letter: str
+    cv_url: str
+    status: Optional[str] = "pending"
+
+# Auth utils
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+def verify_password(plain_password, hashed_password):
+    return pwd_context.verify(plain_password, hashed_password)
+
+def get_password_hash(password):
+    return pwd_context.hash(password)
+
+def create_access_token(data: dict, expires_delta: timedelta = None):
+    to_encode = data.copy()
+    expire = datetime.utcnow() + (expires_delta or timedelta(minutes=15))
+    to_encode.update({"exp": expire})
+    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+
+# Auth endpoints
+@app.post("/signup")
+async def signup(user: User):
+    existing = await db.users.find_one({"email": user.email})
+    if existing:
+        raise HTTPException(status_code=400, detail="Email already registered")
+    user.password = get_password_hash(user.password)
+    await db.users.insert_one(user.dict())
+    return {"message": "User created"}
+
+@app.post("/login")
+async def login(form_data: OAuth2PasswordRequestForm = Depends()):
+    user = await db.users.find_one({"email": form_data.username})
+    if not user or not verify_password(form_data.password, user["password"]):
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+    token = create_access_token(data={"sub": user["email"]}, expires_delta=timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
+    return {"access_token": token, "token_type": "bearer"}
+
+# Job endpoints
+@app.post("/jobs")
+async def add_job(job: Job):
+    await db.jobs.insert_one(job.dict())
+    return {"message": "Job added"}
+
+@app.get("/jobs")
+async def list_jobs():
+    jobs = await db.jobs.find({"deadline": {"$gte": datetime.utcnow()}}).sort("rank").to_list(length=100)
+    return jobs
+
+# Application endpoint
+@app.post("/apply")
+async def apply(job_id: str, user_id: str, cover_letter: str = "", cv: UploadFile = File(...)):
+    filename = f"uploads/{user_id}_{cv.filename}"
+    with open(filename, "wb") as f:
+        f.write(await cv.read())
+    await db.applications.insert_one({
+        "job_id": job_id,
+        "user_id": user_id,
+        "cover_letter": cover_letter,
+        "cv_url": filename,
+        "status": "pending"}
+    )
+    return {"message": "Application submitted"}
+
+# Bulk email sending
+@app.post("/send-applications")
+async def send_bulk_applications(user_id: str):
+    user = await db.users.find_one({"_id": user_id})
+    apps = await db.applications.find({"user_id": user_id}).to_list(length=100)
+    for app in apps:
+        job = await db.jobs.find_one({"_id": app["job_id"]})
+        msg = MIMEMultipart()
+        msg['From'] = EMAIL_SENDER
+        msg['To'] = job["email"]
+        msg['Subject'] = f"Candidature – Poste en cybersécurité"
+        body = app["cover_letter"]
+        msg.attach(MIMEText(body, "plain"))
+        with open(app["cv_url"], "rb") as f:
+            part = MIMEApplication(f.read(), Name=os.path.basename(app["cv_url"]))
+            part['Content-Disposition'] = f'attachment; filename="{os.path.basename(app["cv_url"])}"'
+            msg.attach(part)
+        with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as server:
+            server.starttls()
+            server.login(EMAIL_SENDER, EMAIL_PASSWORD)
+            server.sendmail(EMAIL_SENDER, job["email"], msg.as_string())
+    return {"message": "All applications sent"}
+
+# AI-assisted letter generation
+@app.post("/generate-letter")
+async def generate_letter(company: str, position: str):
+    prompt = f"Rédige une lettre de motivation professionnelle pour un poste en {position} à l'entreprise {company}."
+    openrouter.api_key = OPENROUTER_API_KEY
+    response = openai.ChatCompletion.create(
+        model="Quasar Alpha",
+        messages=[{"role": "user", "content": prompt}]
+    )
+    return {"letter": response.choices[0].message.content}
